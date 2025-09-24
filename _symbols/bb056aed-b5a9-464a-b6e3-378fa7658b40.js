@@ -1,4 +1,4 @@
-// Overlay - Updated September 23, 2025
+// Overlay - Updated September 24, 2025
 function noop() { }
 function run(fn) {
     return fn();
@@ -15,16 +15,274 @@ function is_function(thing) {
 function safe_not_equal(a, b) {
     return a != a ? b == b : a !== b || ((a && typeof a === 'object') || typeof a === 'function');
 }
+let src_url_equal_anchor;
+function src_url_equal(element_src, url) {
+    if (!src_url_equal_anchor) {
+        src_url_equal_anchor = document.createElement('a');
+    }
+    src_url_equal_anchor.href = url;
+    return element_src === src_url_equal_anchor.href;
+}
 function is_empty(obj) {
     return Object.keys(obj).length === 0;
+}
+
+// Track which nodes are claimed during hydration. Unclaimed nodes can then be removed from the DOM
+// at the end of hydration without touching the remaining nodes.
+let is_hydrating = false;
+function start_hydrating() {
+    is_hydrating = true;
+}
+function end_hydrating() {
+    is_hydrating = false;
+}
+function upper_bound(low, high, key, value) {
+    // Return first index of value larger than input value in the range [low, high)
+    while (low < high) {
+        const mid = low + ((high - low) >> 1);
+        if (key(mid) <= value) {
+            low = mid + 1;
+        }
+        else {
+            high = mid;
+        }
+    }
+    return low;
+}
+function init_hydrate(target) {
+    if (target.hydrate_init)
+        return;
+    target.hydrate_init = true;
+    // We know that all children have claim_order values since the unclaimed have been detached if target is not <head>
+    let children = target.childNodes;
+    // If target is <head>, there may be children without claim_order
+    if (target.nodeName === 'HEAD') {
+        const myChildren = [];
+        for (let i = 0; i < children.length; i++) {
+            const node = children[i];
+            if (node.claim_order !== undefined) {
+                myChildren.push(node);
+            }
+        }
+        children = myChildren;
+    }
+    /*
+    * Reorder claimed children optimally.
+    * We can reorder claimed children optimally by finding the longest subsequence of
+    * nodes that are already claimed in order and only moving the rest. The longest
+    * subsequence of nodes that are claimed in order can be found by
+    * computing the longest increasing subsequence of .claim_order values.
+    *
+    * This algorithm is optimal in generating the least amount of reorder operations
+    * possible.
+    *
+    * Proof:
+    * We know that, given a set of reordering operations, the nodes that do not move
+    * always form an increasing subsequence, since they do not move among each other
+    * meaning that they must be already ordered among each other. Thus, the maximal
+    * set of nodes that do not move form a longest increasing subsequence.
+    */
+    // Compute longest increasing subsequence
+    // m: subsequence length j => index k of smallest value that ends an increasing subsequence of length j
+    const m = new Int32Array(children.length + 1);
+    // Predecessor indices + 1
+    const p = new Int32Array(children.length);
+    m[0] = -1;
+    let longest = 0;
+    for (let i = 0; i < children.length; i++) {
+        const current = children[i].claim_order;
+        // Find the largest subsequence length such that it ends in a value less than our current value
+        // upper_bound returns first greater value, so we subtract one
+        // with fast path for when we are on the current longest subsequence
+        const seqLen = ((longest > 0 && children[m[longest]].claim_order <= current) ? longest + 1 : upper_bound(1, longest, idx => children[m[idx]].claim_order, current)) - 1;
+        p[i] = m[seqLen] + 1;
+        const newLen = seqLen + 1;
+        // We can guarantee that current is the smallest value. Otherwise, we would have generated a longer sequence.
+        m[newLen] = i;
+        longest = Math.max(newLen, longest);
+    }
+    // The longest increasing subsequence of nodes (initially reversed)
+    const lis = [];
+    // The rest of the nodes, nodes that will be moved
+    const toMove = [];
+    let last = children.length - 1;
+    for (let cur = m[longest] + 1; cur != 0; cur = p[cur - 1]) {
+        lis.push(children[cur - 1]);
+        for (; last >= cur; last--) {
+            toMove.push(children[last]);
+        }
+        last--;
+    }
+    for (; last >= 0; last--) {
+        toMove.push(children[last]);
+    }
+    lis.reverse();
+    // We sort the nodes being moved to guarantee that their insertion order matches the claim order
+    toMove.sort((a, b) => a.claim_order - b.claim_order);
+    // Finally, we move the nodes
+    for (let i = 0, j = 0; i < toMove.length; i++) {
+        while (j < lis.length && toMove[i].claim_order >= lis[j].claim_order) {
+            j++;
+        }
+        const anchor = j < lis.length ? lis[j] : null;
+        target.insertBefore(toMove[i], anchor);
+    }
+}
+function append_hydration(target, node) {
+    if (is_hydrating) {
+        init_hydrate(target);
+        if ((target.actual_end_child === undefined) || ((target.actual_end_child !== null) && (target.actual_end_child.parentNode !== target))) {
+            target.actual_end_child = target.firstChild;
+        }
+        // Skip nodes of undefined ordering
+        while ((target.actual_end_child !== null) && (target.actual_end_child.claim_order === undefined)) {
+            target.actual_end_child = target.actual_end_child.nextSibling;
+        }
+        if (node !== target.actual_end_child) {
+            // We only insert if the ordering of this node should be modified or the parent node is not target
+            if (node.claim_order !== undefined || node.parentNode !== target) {
+                target.insertBefore(node, target.actual_end_child);
+            }
+        }
+        else {
+            target.actual_end_child = node.nextSibling;
+        }
+    }
+    else if (node.parentNode !== target || node.nextSibling !== null) {
+        target.appendChild(node);
+    }
+}
+function insert_hydration(target, node, anchor) {
+    if (is_hydrating && !anchor) {
+        append_hydration(target, node);
+    }
+    else if (node.parentNode !== target || node.nextSibling != anchor) {
+        target.insertBefore(node, anchor || null);
+    }
 }
 function detach(node) {
     if (node.parentNode) {
         node.parentNode.removeChild(node);
     }
 }
+function element(name) {
+    return document.createElement(name);
+}
+function text(data) {
+    return document.createTextNode(data);
+}
+function space() {
+    return text(' ');
+}
+function listen(node, event, handler, options) {
+    node.addEventListener(event, handler, options);
+    return () => node.removeEventListener(event, handler, options);
+}
+function attr(node, attribute, value) {
+    if (value == null)
+        node.removeAttribute(attribute);
+    else if (node.getAttribute(attribute) !== value)
+        node.setAttribute(attribute, value);
+}
 function children(element) {
     return Array.from(element.childNodes);
+}
+function init_claim_info(nodes) {
+    if (nodes.claim_info === undefined) {
+        nodes.claim_info = { last_index: 0, total_claimed: 0 };
+    }
+}
+function claim_node(nodes, predicate, processNode, createNode, dontUpdateLastIndex = false) {
+    // Try to find nodes in an order such that we lengthen the longest increasing subsequence
+    init_claim_info(nodes);
+    const resultNode = (() => {
+        // We first try to find an element after the previous one
+        for (let i = nodes.claim_info.last_index; i < nodes.length; i++) {
+            const node = nodes[i];
+            if (predicate(node)) {
+                const replacement = processNode(node);
+                if (replacement === undefined) {
+                    nodes.splice(i, 1);
+                }
+                else {
+                    nodes[i] = replacement;
+                }
+                if (!dontUpdateLastIndex) {
+                    nodes.claim_info.last_index = i;
+                }
+                return node;
+            }
+        }
+        // Otherwise, we try to find one before
+        // We iterate in reverse so that we don't go too far back
+        for (let i = nodes.claim_info.last_index - 1; i >= 0; i--) {
+            const node = nodes[i];
+            if (predicate(node)) {
+                const replacement = processNode(node);
+                if (replacement === undefined) {
+                    nodes.splice(i, 1);
+                }
+                else {
+                    nodes[i] = replacement;
+                }
+                if (!dontUpdateLastIndex) {
+                    nodes.claim_info.last_index = i;
+                }
+                else if (replacement === undefined) {
+                    // Since we spliced before the last_index, we decrease it
+                    nodes.claim_info.last_index--;
+                }
+                return node;
+            }
+        }
+        // If we can't find any matching node, we create a new one
+        return createNode();
+    })();
+    resultNode.claim_order = nodes.claim_info.total_claimed;
+    nodes.claim_info.total_claimed += 1;
+    return resultNode;
+}
+function claim_element_base(nodes, name, attributes, create_element) {
+    return claim_node(nodes, (node) => node.nodeName === name, (node) => {
+        const remove = [];
+        for (let j = 0; j < node.attributes.length; j++) {
+            const attribute = node.attributes[j];
+            if (!attributes[attribute.name]) {
+                remove.push(attribute.name);
+            }
+        }
+        remove.forEach(v => node.removeAttribute(v));
+        return undefined;
+    }, () => create_element(name));
+}
+function claim_element(nodes, name, attributes) {
+    return claim_element_base(nodes, name, attributes, element);
+}
+function claim_text(nodes, data) {
+    return claim_node(nodes, (node) => node.nodeType === 3, (node) => {
+        const dataStr = '' + data;
+        if (node.data.startsWith(dataStr)) {
+            if (node.data.length !== dataStr.length) {
+                return node.splitText(dataStr.length);
+            }
+        }
+        else {
+            node.data = dataStr;
+        }
+    }, () => text(data), true // Text nodes should not update last index since it is likely not worth it to eliminate an increasing subsequence of actual elements
+    );
+}
+function claim_space(nodes) {
+    return claim_text(nodes, ' ');
+}
+function set_data(text, data) {
+    data = '' + data;
+    if (text.data === data)
+        return;
+    text.data = data;
+}
+function toggle_class(element, name, toggle) {
+    element.classList[toggle ? 'add' : 'remove'](name);
 }
 
 let current_component;
@@ -249,6 +507,7 @@ function init(component, options, instance, create_fragment, not_equal, props, a
     $$.fragment = create_fragment ? create_fragment($$.ctx) : false;
     if (options.target) {
         if (options.hydrate) {
+            start_hydrating();
             const nodes = children(options.target);
             // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
             $$.fragment && $$.fragment.l(nodes);
@@ -261,6 +520,7 @@ function init(component, options, instance, create_fragment, not_equal, props, a
         if (options.intro)
             transition_in(component.$$.fragment);
         mount_component(component, options.target, options.anchor, options.customElement);
+        end_hydrating();
         flush();
     }
     set_current_component(parent_component);
@@ -296,12 +556,143 @@ class SvelteComponent {
 
 /* generated by Svelte v3.59.1 */
 
+function create_fragment(ctx) {
+	let div2;
+	let div0;
+	let video_1;
+	let video_1_src_value;
+	let t0;
+	let div1;
+	let h2;
+	let t1;
+	let t2;
+	let img;
+	let img_src_value;
+	let img_alt_value;
+	let t3;
+	let button;
+	let t4;
+	let mounted;
+	let dispose;
+
+	return {
+		c() {
+			div2 = element("div");
+			div0 = element("div");
+			video_1 = element("video");
+			t0 = space();
+			div1 = element("div");
+			h2 = element("h2");
+			t1 = text(/*message*/ ctx[3]);
+			t2 = space();
+			img = element("img");
+			t3 = space();
+			button = element("button");
+			t4 = text(/*text*/ ctx[1]);
+			this.h();
+		},
+		l(nodes) {
+			div2 = claim_element(nodes, "DIV", { class: true });
+			var div2_nodes = children(div2);
+			div0 = claim_element(div2_nodes, "DIV", { class: true });
+			var div0_nodes = children(div0);
+			video_1 = claim_element(div0_nodes, "VIDEO", { class: true, src: true });
+			children(video_1).forEach(detach);
+			div0_nodes.forEach(detach);
+			t0 = claim_space(div2_nodes);
+			div1 = claim_element(div2_nodes, "DIV", { class: true });
+			var div1_nodes = children(div1);
+			h2 = claim_element(div1_nodes, "H2", { class: true });
+			var h2_nodes = children(h2);
+			t1 = claim_text(h2_nodes, /*message*/ ctx[3]);
+			h2_nodes.forEach(detach);
+			t2 = claim_space(div1_nodes);
+			img = claim_element(div1_nodes, "IMG", { src: true, alt: true });
+			t3 = claim_space(div1_nodes);
+			button = claim_element(div1_nodes, "BUTTON", { class: true });
+			var button_nodes = children(button);
+			t4 = claim_text(button_nodes, /*text*/ ctx[1]);
+			button_nodes.forEach(detach);
+			div1_nodes.forEach(detach);
+			div2_nodes.forEach(detach);
+			this.h();
+		},
+		h() {
+			attr(video_1, "class", "background-video svelte-1x7c3lx");
+			video_1.autoplay = true;
+			video_1.loop = true;
+			video_1.muted = true;
+			if (!src_url_equal(video_1.src, video_1_src_value = /*video*/ ctx[2])) attr(video_1, "src", video_1_src_value);
+			attr(div0, "class", "video-container svelte-1x7c3lx");
+			attr(h2, "class", "svelte-1x7c3lx");
+			if (!src_url_equal(img.src, img_src_value = /*logo*/ ctx[0].url)) attr(img, "src", img_src_value);
+			attr(img, "alt", img_alt_value = /*logo*/ ctx[0].alt);
+			attr(button, "class", "enter-button svelte-1x7c3lx");
+			attr(div1, "class", "content svelte-1x7c3lx");
+			attr(div2, "class", "overlay svelte-1x7c3lx");
+			toggle_class(div2, "hidden", !/*showOverlay*/ ctx[4]);
+		},
+		m(target, anchor) {
+			insert_hydration(target, div2, anchor);
+			append_hydration(div2, div0);
+			append_hydration(div0, video_1);
+			append_hydration(div2, t0);
+			append_hydration(div2, div1);
+			append_hydration(div1, h2);
+			append_hydration(h2, t1);
+			append_hydration(div1, t2);
+			append_hydration(div1, img);
+			append_hydration(div1, t3);
+			append_hydration(div1, button);
+			append_hydration(button, t4);
+
+			if (!mounted) {
+				dispose = listen(button, "click", /*EnterPage*/ ctx[5]);
+				mounted = true;
+			}
+		},
+		p(ctx, [dirty]) {
+			if (dirty & /*video*/ 4 && !src_url_equal(video_1.src, video_1_src_value = /*video*/ ctx[2])) {
+				attr(video_1, "src", video_1_src_value);
+			}
+
+			if (dirty & /*message*/ 8) set_data(t1, /*message*/ ctx[3]);
+
+			if (dirty & /*logo*/ 1 && !src_url_equal(img.src, img_src_value = /*logo*/ ctx[0].url)) {
+				attr(img, "src", img_src_value);
+			}
+
+			if (dirty & /*logo*/ 1 && img_alt_value !== (img_alt_value = /*logo*/ ctx[0].alt)) {
+				attr(img, "alt", img_alt_value);
+			}
+
+			if (dirty & /*text*/ 2) set_data(t4, /*text*/ ctx[1]);
+
+			if (dirty & /*showOverlay*/ 16) {
+				toggle_class(div2, "hidden", !/*showOverlay*/ ctx[4]);
+			}
+		},
+		i: noop,
+		o: noop,
+		d(detaching) {
+			if (detaching) detach(div2);
+			mounted = false;
+			dispose();
+		}
+	};
+}
+
 function instance($$self, $$props, $$invalidate) {
 	let { props } = $$props;
 	let { logo } = $$props;
 	let { text } = $$props;
 	let { video } = $$props;
 	let { message } = $$props;
+	let showOverlay = true;
+
+	function EnterPage() {
+		$$invalidate(4, showOverlay = !showOverlay);
+	}
 
 	onMount(() => {
 		const ua = navigator.userAgent.toLowerCase();
@@ -320,30 +711,32 @@ function instance($$self, $$props, $$invalidate) {
 			"builder.dws.gr"
 		]; // Yahoo
 
-		if (crawlers.some(bot => ua.includes(bot))) ;
+		if (crawlers.some(bot => ua.includes(bot))) {
+			EnterPage();
+		}
 	});
 
 	$$self.$$set = $$props => {
-		if ('props' in $$props) $$invalidate(0, props = $$props.props);
-		if ('logo' in $$props) $$invalidate(1, logo = $$props.logo);
-		if ('text' in $$props) $$invalidate(2, text = $$props.text);
-		if ('video' in $$props) $$invalidate(3, video = $$props.video);
-		if ('message' in $$props) $$invalidate(4, message = $$props.message);
+		if ('props' in $$props) $$invalidate(6, props = $$props.props);
+		if ('logo' in $$props) $$invalidate(0, logo = $$props.logo);
+		if ('text' in $$props) $$invalidate(1, text = $$props.text);
+		if ('video' in $$props) $$invalidate(2, video = $$props.video);
+		if ('message' in $$props) $$invalidate(3, message = $$props.message);
 	};
 
-	return [props, logo, text, video, message];
+	return [logo, text, video, message, showOverlay, EnterPage, props];
 }
 
 class Component extends SvelteComponent {
 	constructor(options) {
 		super();
 
-		init(this, options, instance, null, safe_not_equal, {
-			props: 0,
-			logo: 1,
-			text: 2,
-			video: 3,
-			message: 4
+		init(this, options, instance, create_fragment, safe_not_equal, {
+			props: 6,
+			logo: 0,
+			text: 1,
+			video: 2,
+			message: 3
 		});
 	}
 }
